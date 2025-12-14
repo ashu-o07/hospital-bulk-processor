@@ -13,21 +13,16 @@ def test_bulk_create_success(tmp_path):
         return_value=Response(201, json={"id": 101})
     )
 
-    respx.patch(
-        re.compile(f"{HOSPITAL_API_BASE}/hospitals/batch/.*/activate")
-    ).mock(
+    respx.patch(re.compile(f"{HOSPITAL_API_BASE}/hospitals/batch/.*/activate")).mock(
         return_value=Response(200, json={"activated": True})
     )
 
     csv_file = tmp_path / "test.csv"
-    csv_file.write_text(
-        "Hospital A,Addr A,123\nHospital B,Addr B,456\n"
-    )
+    csv_file.write_text("Hospital A,Addr A,123\nHospital B,Addr B,456\n")
 
     with open(csv_file, "rb") as f:
         response = client.post(
-            "/hospitals/bulk",
-            files={"file": ("test.csv", f, "text/csv")}
+            "/hospitals/bulk", files={"file": ("test.csv", f, "text/csv")}
         )
 
     assert response.status_code == 200

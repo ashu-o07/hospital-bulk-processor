@@ -4,7 +4,14 @@ import csv
 import io
 import time
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    File,
+    UploadFile,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import JSONResponse
 import asyncio
 import httpx
@@ -26,12 +33,14 @@ POLL_UPDATE_INTERVAL = 0.8  # seconds for WS ping
 
 app = FastAPI(title="Hospital Bulk Processor (with progress)")
 
+
 class RowResult(BaseModel):
     row: int
     hospital_id: Optional[int] = None
     name: str
     status: str
     error: Optional[str] = None
+
 
 # --- In-memory status store (process-lifetime only) ---
 # Structure:
@@ -54,11 +63,13 @@ BATCH_STORE = {}
 # Simple registry for websocket connections per batch
 WS_CONNECTIONS: Dict[str, List[WebSocket]] = {}
 
+
 def _broadcast_ws(batch_id: str, payload: Dict[str, Any]):
     conns = WS_CONNECTIONS.get(batch_id, [])
     # fire-and-forget, don't block main processing
     for ws in list(conns):
         asyncio.create_task(_safe_send(ws, payload))
+
 
 async def _safe_send(ws: WebSocket, payload: Dict[str, Any]):
     try:
@@ -70,6 +81,7 @@ async def _safe_send(ws: WebSocket, payload: Dict[str, Any]):
         except Exception:
             pass
 
+
 def _init_batch_status(batch_id: str, rows: List[Dict[str, str]]):
     BATCH_STATUS[batch_id] = {
         "total": len(rows),
@@ -77,10 +89,26 @@ def _init_batch_status(batch_id: str, rows: List[Dict[str, str]]):
         "failed": 0,
         "status": "processing",
         "started_at": time.time(),
-        "rows": [{"index": i, "name": r["name"], "status": "pending", "hospital_id": None, "error": None} for i, r in enumerate(rows)]
+        "rows": [
+            {
+                "index": i,
+                "name": r["name"],
+                "status": "pending",
+                "hospital_id": None,
+                "error": None,
+            }
+            for i, r in enumerate(rows)
+        ],
     }
 
-def _update_row_status(batch_id: str, idx: int, status: str, hospital_id: Optional[int] = None, error: Optional[str] = None):
+
+def _update_row_status(
+    batch_id: str,
+    idx: int,
+    status: str,
+    hospital_id: Optional[int] = None,
+    error: Optional[str] = None,
+):
     st = BATCH_STATUS.get(batch_id)
     if not st:
         return
@@ -93,14 +121,23 @@ def _update_row_status(batch_id: str, idx: int, status: str, hospital_id: Option
     row_entry["status"] = status
     row_entry["hospital_id"] = hospital_id
     row_entry["error"] = error
-    _broadcast_ws(batch_id, {
-        "batch_id": batch_id,
-        "total": st["total"],
-        "done": st["done"],
-        "failed": st["failed"],
-        "status": st["status"],
-        "row": {"index": idx, "status": status, "hospital_id": hospital_id, "error": error}
-    })
+    _broadcast_ws(
+        batch_id,
+        {
+            "batch_id": batch_id,
+            "total": st["total"],
+            "done": st["done"],
+            "failed": st["failed"],
+            "status": st["status"],
+            "row": {
+                "index": idx,
+                "status": status,
+                "hospital_id": hospital_id,
+                "error": error,
+            },
+        },
+    )
+
 
 def _finalize_batch(batch_id: str, success: bool = True):
     st = BATCH_STATUS.get(batch_id)
@@ -109,42 +146,57 @@ def _finalize_batch(batch_id: str, success: bool = True):
     st["status"] = "done" if success else "error"
     st["finished_at"] = time.time()
     # final broadcast
-    _broadcast_ws(batch_id, {
-        "batch_id": batch_id,
-        "total": st["total"],
-        "done": st["done"],
-        "failed": st["failed"],
-        "status": st["status"]
-    })
+    _broadcast_ws(
+        batch_id,
+        {
+            "batch_id": batch_id,
+            "total": st["total"],
+            "done": st["done"],
+            "failed": st["failed"],
+            "status": st["status"],
+        },
+    )
+
 
 # --- CSV parsing & validation ---
 def _validate_and_parse_csv(file_bytes: bytes) -> List[Dict[str, str]]:
     errors = []
     rows = []
     try:
-        text = file_bytes.decode('utf-8-sig')
+        text = file_bytes.decode("utf-8-sig")
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="CSV must be UTF-8 encoded")
     reader = csv.reader(io.StringIO(text))
-    rows: List[Dict[str,str]] = []
+    rows: List[Dict[str, str]] = []
     line_no = 0
     for r in reader:
         line_no += 1
         if not r or all(not cell.strip() for cell in r):
             continue
         if len(r) < 2:
-            raise HTTPException(status_code=400, detail=f"CSV row {line_no} must have at least name and address")
+            raise HTTPException(
+                status_code=400,
+                detail=f"CSV row {line_no} must have at least name and address",
+            )
         name = r[0].strip()
         address = r[1].strip()
         phone = r[2].strip() if len(r) >= 3 else ""
         if not name or not address:
-            raise HTTPException(status_code=400, detail=f"CSV row {line_no} missing name or address")
+            raise HTTPException(
+                status_code=400, detail=f"CSV row {line_no} missing name or address"
+            )
         rows.append({"name": name, "address": address, "phone": phone})
         if len(rows) > MAX_HOSPITALS:
-            raise HTTPException(status_code=400, detail=f"CSV has more than allowed {MAX_HOSPITALS} hospitals")
+            raise HTTPException(
+                status_code=400,
+                detail=f"CSV has more than allowed {MAX_HOSPITALS} hospitals",
+            )
     if not rows:
-        raise HTTPException(status_code=400, detail="CSV contained no valid hospital rows")
+        raise HTTPException(
+            status_code=400, detail="CSV contained no valid hospital rows"
+        )
     return rows
+
 
 def validate_csv_with_errors(file_bytes: bytes):
     try:
@@ -173,19 +225,21 @@ def validate_csv_with_errors(file_bytes: bytes):
             errors.append({"row": idx, "error": "Missing address"})
 
         if name and address:
-            rows.append({
-                "name": name,
-                "address": address,
-                "phone": r[2].strip() if len(r) > 2 else ""
-            })
+            rows.append(
+                {
+                    "name": name,
+                    "address": address,
+                    "phone": r[2].strip() if len(r) > 2 else "",
+                }
+            )
 
     if len(rows) > MAX_HOSPITALS:
-        errors.append({
-            "row": None,
-            "error": f"CSV exceeds maximum {MAX_HOSPITALS} hospitals"
-        })
+        errors.append(
+            {"row": None, "error": f"CSV exceeds maximum {MAX_HOSPITALS} hospitals"}
+        )
 
     return len(errors) == 0, rows, errors
+
 
 # --- Validation-only endpoint (quick check) ---
 @app.post("/hospitals/bulk/validate")
@@ -198,16 +252,19 @@ async def validate_csv(file: UploadFile = File(...)):
         "valid": valid,
         "total_rows": len(rows) + len(errors),
         "valid_rows": len(rows),
-        "errors": errors
+        "errors": errors,
     }
 
+
 # --- HTTP helper with retry/backoff ---
-async def _post_hospital(client: httpx.AsyncClient, payload: Dict[str, Any], batch_id: str) -> Dict[str, Any]:
+async def _post_hospital(
+    client: httpx.AsyncClient, payload: Dict[str, Any], batch_id: str
+) -> Dict[str, Any]:
     body = {
         "name": payload["name"],
         "address": payload["address"],
         "phone": payload.get("phone", ""),
-        "creation_batch_id": batch_id
+        "creation_batch_id": batch_id,
     }
     url = f"{HOSPITAL_API_BASE}/hospitals/"
     last_exc: Optional[Exception] = None
@@ -222,10 +279,11 @@ async def _post_hospital(client: httpx.AsyncClient, payload: Dict[str, Any], bat
         await asyncio.sleep(RETRY_BACKOFF * attempt)
     raise last_exc or Exception("unknown error during POST")
 
+
 # --- Bulk processing endpoint (main) ---
 @app.post("/hospitals/bulk")
 async def bulk_create_hospitals(file: UploadFile = File(...)):
-    if file.filename and not file.filename.lower().endswith(('.csv', '.txt')):
+    if file.filename and not file.filename.lower().endswith((".csv", ".txt")):
         # allow but warn
         print(f"Warning: uploaded filename {file.filename} doesn't end with .csv/.txt")
 
@@ -241,28 +299,33 @@ async def bulk_create_hospitals(file: UploadFile = File(...)):
     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
     async with httpx.AsyncClient() as client:
-        async def worker(idx: int, payload: Dict[str,str]):
+
+        async def worker(idx: int, payload: Dict[str, str]):
             async with semaphore:
                 try:
                     resp_json = await _post_hospital(client, payload, batch_id)
                     hospital_id = resp_json.get("id") or resp_json.get("hospital_id")
                     # update in-memory status
-                    _update_row_status(batch_id, idx, "created", hospital_id=hospital_id)
+                    _update_row_status(
+                        batch_id, idx, "created", hospital_id=hospital_id
+                    )
                     return RowResult(
-                                    row=idx + 1,
-                                    hospital_id=hospital_id,
-                                    name=payload["name"],
-                                    status="created"
-                                )
+                        row=idx + 1,
+                        hospital_id=hospital_id,
+                        name=payload["name"],
+                        status="created",
+                    )
                 except Exception as e:
-                    _update_row_status(batch_id, idx, "failed", hospital_id=None, error=str(e))
+                    _update_row_status(
+                        batch_id, idx, "failed", hospital_id=None, error=str(e)
+                    )
                     return RowResult(
-                                    row=idx + 1,
-                                    hospital_id=None,
-                                    name=payload["name"],
-                                    status="failed",
-                                    error=str(e)
-                                )
+                        row=idx + 1,
+                        hospital_id=None,
+                        name=payload["name"],
+                        status="failed",
+                        error=str(e),
+                    )
 
         tasks = [worker(i, r) for i, r in enumerate(rows)]
         results: List[RowResult] = await asyncio.gather(*tasks)
@@ -273,10 +336,15 @@ async def bulk_create_hospitals(file: UploadFile = File(...)):
         activation_error = None
         if created_count > 0:
             try:
-                act = await client.patch(f"{HOSPITAL_API_BASE}/hospitals/batch/{batch_id}/activate", timeout=REQUEST_TIMEOUT)
-                batch_activated = act.status_code in (200,204)
+                act = await client.patch(
+                    f"{HOSPITAL_API_BASE}/hospitals/batch/{batch_id}/activate",
+                    timeout=REQUEST_TIMEOUT,
+                )
+                batch_activated = act.status_code in (200, 204)
                 if not batch_activated:
-                    activation_error = f"activation_status={act.status_code}, body={act.text}"
+                    activation_error = (
+                        f"activation_status={act.status_code}, body={act.text}"
+                    )
             except Exception as e:
                 activation_error = str(e)
 
@@ -297,26 +365,31 @@ async def bulk_create_hospitals(file: UploadFile = File(...)):
 
     # build response
     hospitals_out = [r.dict() for r in results]
-    
+
     with BATCH_LOCK:
         BATCH_STORE[batch_id] = {
-            "rows": rows,   
+            "rows": rows,
             "results": results,
             "activated": batch_activated,
-            "started_at": start_ts
+            "started_at": start_ts,
         }
 
     response = {
         "batch_id": batch_id,
         "total_hospitals": total,
-        "processed_hospitals": sum(1 for r in hospitals_out if r["status"].startswith("created")),
-        "failed_hospitals": sum(1 for r in hospitals_out if r["status"].startswith("failed")),
+        "processed_hospitals": sum(
+            1 for r in hospitals_out if r["status"].startswith("created")
+        ),
+        "failed_hospitals": sum(
+            1 for r in hospitals_out if r["status"].startswith("failed")
+        ),
         "processing_time_seconds": elapsed,
         "batch_activated": batch_activated,
         "activation_error": activation_error,
-        "hospitals": hospitals_out
+        "hospitals": hospitals_out,
     }
     return JSONResponse(status_code=200, content=response)
+
 
 # --- Polling endpoint to get batch status ---
 @app.get("/bulk/status/{batch_id}")
@@ -330,8 +403,9 @@ async def bulk_status(batch_id: str):
         "done": st["done"],
         "failed": st["failed"],
         "status": st["status"],
-        "rows": st["rows"]
+        "rows": st["rows"],
     }
+
 
 # --- WebSocket endpoint for real-time updates ---
 @app.websocket("/ws/progress/{batch_id}")
@@ -342,13 +416,15 @@ async def ws_progress(websocket: WebSocket, batch_id: str):
         # send initial snapshot if available
         st = BATCH_STATUS.get(batch_id)
         if st:
-            await websocket.send_json({
-                "batch_id": batch_id,
-                "total": st["total"],
-                "done": st["done"],
-                "failed": st["failed"],
-                "status": st["status"]
-            })
+            await websocket.send_json(
+                {
+                    "batch_id": batch_id,
+                    "total": st["total"],
+                    "done": st["done"],
+                    "failed": st["failed"],
+                    "status": st["status"],
+                }
+            )
         else:
             await websocket.send_json({"batch_id": batch_id, "status": "not_found"})
         # keep connection alive until batch done or client disconnects
@@ -356,13 +432,15 @@ async def ws_progress(websocket: WebSocket, batch_id: str):
             # simple keep-alive heartbeat and snapshot every POLL_UPDATE_INTERVAL
             st = BATCH_STATUS.get(batch_id)
             if st:
-                await websocket.send_json({
-                    "batch_id": batch_id,
-                    "total": st["total"],
-                    "done": st["done"],
-                    "failed": st["failed"],
-                    "status": st["status"]
-                })
+                await websocket.send_json(
+                    {
+                        "batch_id": batch_id,
+                        "total": st["total"],
+                        "done": st["done"],
+                        "failed": st["failed"],
+                        "status": st["status"],
+                    }
+                )
                 if st["status"] == "done":
                     await websocket.close()
                     return
@@ -380,6 +458,7 @@ async def ws_progress(websocket: WebSocket, batch_id: str):
         except Exception:
             pass
 
+
 # --- Resume failed bulk operations ---
 @app.post("/hospitals/bulk/{batch_id}/resume")
 async def resume_bulk(batch_id: str):
@@ -389,9 +468,7 @@ async def resume_bulk(batch_id: str):
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
 
-    failed_indices = [
-        i for i, r in enumerate(batch["results"]) if r.status == "failed"
-    ]
+    failed_indices = [i for i, r in enumerate(batch["results"]) if r.status == "failed"]
 
     if not failed_indices:
         return {"message": "No failed rows to resume", "batch_id": batch_id}
@@ -405,7 +482,7 @@ async def resume_bulk(batch_id: str):
                     row=i + 1,
                     hospital_id=resp.get("id"),
                     name=payload["name"],
-                    status="created"
+                    status="created",
                 )
 
             except Exception as e:
@@ -414,15 +491,16 @@ async def resume_bulk(batch_id: str):
         # try activation again
         act = await client.patch(
             f"{HOSPITAL_API_BASE}/hospitals/batch/{batch_id}/activate",
-            timeout=REQUEST_TIMEOUT
+            timeout=REQUEST_TIMEOUT,
         )
         batch["activated"] = act.status_code in (200, 204)
 
     return {
         "batch_id": batch_id,
         "resumed": len(failed_indices),
-        "batch_activated": batch["activated"]
+        "batch_activated": batch["activated"],
     }
+
 
 # --- Batch delete endpoint ---
 @app.delete("/hospitals/bulk/{batch_id}")
@@ -433,8 +511,7 @@ async def delete_batch(batch_id: str):
 
     async with httpx.AsyncClient() as client:
         await client.delete(
-            f"{HOSPITAL_API_BASE}/hospitals/batch/{batch_id}",
-            timeout=REQUEST_TIMEOUT
+            f"{HOSPITAL_API_BASE}/hospitals/batch/{batch_id}", timeout=REQUEST_TIMEOUT
         )
 
     with BATCH_LOCK:

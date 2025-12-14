@@ -7,8 +7,7 @@ client = TestClient(app)
 def test_validate_endpoint_success():
     data = b"Hospital A,Addr A,123\n"
     response = client.post(
-        "/hospitals/bulk/validate",
-        files={"file": ("test.csv", data, "text/csv")}
+        "/hospitals/bulk/validate", files={"file": ("test.csv", data, "text/csv")}
     )
 
     assert response.status_code == 200

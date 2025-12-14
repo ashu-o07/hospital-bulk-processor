@@ -20,10 +20,10 @@ def test_parse_too_many_rows():
     with pytest.raises(HTTPException):
         _validate_and_parse_csv(lines.encode())
 
+
 def test_validate_csv_with_errors():
     data = b"Hospital A,,123\n,Addr B,456\nHospital C,Addr C\n"
     valid, rows, errors = validate_csv_with_errors(data)
 
     assert valid is False
     assert len(errors) == 2
-
