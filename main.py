@@ -9,9 +9,14 @@ from fastapi.responses import JSONResponse
 import asyncio
 import httpx
 from pydantic import BaseModel
+from threading import Lock
+
+BATCH_STORE = {}
+BATCH_LOCK = Lock()
+
 
 # Config
-HOSPITAL_API_BASE = "https://hospital-directory.onrender.com"  # upstream
+HOSPITAL_API_BASE = "https://hospital-directory.onrender.com"
 MAX_HOSPITALS = 20
 CONCURRENT_REQUESTS = 8
 REQUEST_TIMEOUT = 15.0  # seconds
@@ -39,6 +44,12 @@ class RowResult(BaseModel):
 #   "rows": [ { "index": i, "name":..., "status": "pending"|"created"|"failed", "hospital_id": optional, "error": optional } ]
 # }
 BATCH_STATUS: Dict[str, Dict[str, Any]] = {}
+
+# In-memory registry for bulk batch metadata (original rows, results, activation state).
+# Initialized at app startup and populated per bulk request.
+# Used to support batch lifecycle operations like resume and delete.
+# Data is process-local and cleared on application restart.
+BATCH_STORE = {}
 
 # Simple registry for websocket connections per batch
 WS_CONNECTIONS: Dict[str, List[WebSocket]] = {}
@@ -75,7 +86,6 @@ def _update_row_status(batch_id: str, idx: int, status: str, hospital_id: Option
         return
     row_entry = st["rows"][idx]
     prev_status = row_entry["status"]
-    # adjust counters
     if prev_status not in ("created", "created_and_activated") and status == "created":
         st["done"] += 1
     if prev_status not in ("failed",) and status == "failed":
@@ -83,7 +93,6 @@ def _update_row_status(batch_id: str, idx: int, status: str, hospital_id: Option
     row_entry["status"] = status
     row_entry["hospital_id"] = hospital_id
     row_entry["error"] = error
-    # broadcast to websockets
     _broadcast_ws(batch_id, {
         "batch_id": batch_id,
         "total": st["total"],
@@ -110,6 +119,8 @@ def _finalize_batch(batch_id: str, success: bool = True):
 
 # --- CSV parsing & validation ---
 def _validate_and_parse_csv(file_bytes: bytes) -> List[Dict[str, str]]:
+    errors = []
+    rows = []
     try:
         text = file_bytes.decode('utf-8-sig')
     except UnicodeDecodeError:
@@ -135,12 +146,60 @@ def _validate_and_parse_csv(file_bytes: bytes) -> List[Dict[str, str]]:
         raise HTTPException(status_code=400, detail="CSV contained no valid hospital rows")
     return rows
 
+def validate_csv_with_errors(file_bytes: bytes):
+    try:
+        text = file_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False, [], [{"row": None, "error": "CSV must be UTF-8 encoded"}]
+
+    reader = csv.reader(io.StringIO(text))
+    rows = []
+    errors = []
+
+    for idx, r in enumerate(reader, start=1):
+        if not r or all(not c.strip() for c in r):
+            continue
+
+        if len(r) < 2:
+            errors.append({"row": idx, "error": "Name and address required"})
+            continue
+
+        name = r[0].strip()
+        address = r[1].strip()
+
+        if not name:
+            errors.append({"row": idx, "error": "Missing name"})
+        if not address:
+            errors.append({"row": idx, "error": "Missing address"})
+
+        if name and address:
+            rows.append({
+                "name": name,
+                "address": address,
+                "phone": r[2].strip() if len(r) > 2 else ""
+            })
+
+    if len(rows) > MAX_HOSPITALS:
+        errors.append({
+            "row": None,
+            "error": f"CSV exceeds maximum {MAX_HOSPITALS} hospitals"
+        })
+
+    return len(errors) == 0, rows, errors
+
 # --- Validation-only endpoint (quick check) ---
 @app.post("/hospitals/bulk/validate")
 async def validate_csv(file: UploadFile = File(...)):
     contents = await file.read()
-    rows = _validate_and_parse_csv(contents)  # will raise on invalid
-    return {"valid": True, "rows": len(rows)}
+
+    valid, rows, errors = validate_csv_with_errors(contents)
+
+    return {
+        "valid": valid,
+        "total_rows": len(rows) + len(errors),
+        "valid_rows": len(rows),
+        "errors": errors
+    }
 
 # --- HTTP helper with retry/backoff ---
 async def _post_hospital(client: httpx.AsyncClient, payload: Dict[str, Any], batch_id: str) -> Dict[str, Any]:
@@ -189,16 +248,27 @@ async def bulk_create_hospitals(file: UploadFile = File(...)):
                     hospital_id = resp_json.get("id") or resp_json.get("hospital_id")
                     # update in-memory status
                     _update_row_status(batch_id, idx, "created", hospital_id=hospital_id)
-                    return {"row": idx+1, "hospital_id": hospital_id, "name": payload["name"], "status": "created"}
+                    return RowResult(
+                                    row=idx + 1,
+                                    hospital_id=hospital_id,
+                                    name=payload["name"],
+                                    status="created"
+                                )
                 except Exception as e:
                     _update_row_status(batch_id, idx, "failed", hospital_id=None, error=str(e))
-                    return {"row": idx+1, "hospital_id": None, "name": payload["name"], "status": "failed", "error": str(e)}
+                    return RowResult(
+                                    row=idx + 1,
+                                    hospital_id=None,
+                                    name=payload["name"],
+                                    status="failed",
+                                    error=str(e)
+                                )
 
         tasks = [worker(i, r) for i, r in enumerate(rows)]
-        results = await asyncio.gather(*tasks)
+        results: List[RowResult] = await asyncio.gather(*tasks)
 
         # attempt activation if at least one created
-        created_count = sum(1 for x in results if x["status"] == "created")
+        created_count = sum(1 for x in results if x.status == "created")
         batch_activated = False
         activation_error = None
         if created_count > 0:
@@ -226,9 +296,15 @@ async def bulk_create_hospitals(file: UploadFile = File(...)):
     _finalize_batch(batch_id, success=True)
 
     # build response
-    hospitals_out = []
-    for r in results:
-        hospitals_out.append(r)
+    hospitals_out = [r.dict() for r in results]
+    
+    with BATCH_LOCK:
+        BATCH_STORE[batch_id] = {
+            "rows": rows,   
+            "results": results,
+            "activated": batch_activated,
+            "started_at": start_ts
+        }
 
     response = {
         "batch_id": batch_id,
@@ -261,7 +337,6 @@ async def bulk_status(batch_id: str):
 @app.websocket("/ws/progress/{batch_id}")
 async def ws_progress(websocket: WebSocket, batch_id: str):
     await websocket.accept()
-    # register
     WS_CONNECTIONS.setdefault(batch_id, []).append(websocket)
     try:
         # send initial snapshot if available
@@ -304,3 +379,67 @@ async def ws_progress(websocket: WebSocket, batch_id: str):
             WS_CONNECTIONS[batch_id].remove(websocket)
         except Exception:
             pass
+
+# --- Resume failed bulk operations ---
+@app.post("/hospitals/bulk/{batch_id}/resume")
+async def resume_bulk(batch_id: str):
+    with BATCH_LOCK:
+        batch = BATCH_STORE.get(batch_id)
+
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    failed_indices = [
+        i for i, r in enumerate(batch["results"]) if r.status == "failed"
+    ]
+
+    if not failed_indices:
+        return {"message": "No failed rows to resume", "batch_id": batch_id}
+
+    async with httpx.AsyncClient() as client:
+        for i in failed_indices:
+            payload = batch["rows"][i]
+            try:
+                resp = await _post_hospital(client, payload, batch_id)
+                batch["results"][i] = RowResult(
+                    row=i + 1,
+                    hospital_id=resp.get("id"),
+                    name=payload["name"],
+                    status="created"
+                )
+
+            except Exception as e:
+                batch["results"][i]["error"] = str(e)
+
+        # try activation again
+        act = await client.patch(
+            f"{HOSPITAL_API_BASE}/hospitals/batch/{batch_id}/activate",
+            timeout=REQUEST_TIMEOUT
+        )
+        batch["activated"] = act.status_code in (200, 204)
+
+    return {
+        "batch_id": batch_id,
+        "resumed": len(failed_indices),
+        "batch_activated": batch["activated"]
+    }
+
+# --- Batch delete endpoint ---
+@app.delete("/hospitals/bulk/{batch_id}")
+async def delete_batch(batch_id: str):
+    with BATCH_LOCK:
+        if batch_id not in BATCH_STORE:
+            raise HTTPException(404, "Batch not found")
+
+    async with httpx.AsyncClient() as client:
+        await client.delete(
+            f"{HOSPITAL_API_BASE}/hospitals/batch/{batch_id}",
+            timeout=REQUEST_TIMEOUT
+        )
+
+    with BATCH_LOCK:
+        del BATCH_STORE[batch_id]
+        BATCH_STATUS.pop(batch_id, None)
+        WS_CONNECTIONS.pop(batch_id, None)
+
+    return {"deleted": True, "batch_id": batch_id}

@@ -1,6 +1,6 @@
 import pytest
 from fastapi import HTTPException
-from main import _validate_and_parse_csv
+from main import _validate_and_parse_csv, validate_csv_with_errors
 
 
 def test_parse_basic():
@@ -19,3 +19,11 @@ def test_parse_too_many_rows():
     lines = "\n".join([f"Name{i},Addr{i}," for i in range(21)])
     with pytest.raises(HTTPException):
         _validate_and_parse_csv(lines.encode())
+
+def test_validate_csv_with_errors():
+    data = b"Hospital A,,123\n,Addr B,456\nHospital C,Addr C\n"
+    valid, rows, errors = validate_csv_with_errors(data)
+
+    assert valid is False
+    assert len(errors) == 2
+
